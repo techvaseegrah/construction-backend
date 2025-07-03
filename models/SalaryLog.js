@@ -48,9 +48,15 @@ const salaryLogSchema = mongoose.Schema({
     type: Boolean,
     default: false,
   },
-  paymentDate: {
-    type: Date,
-  }
+paymentDate: {
+  type: Date,
+  default: null,
+},
+    recordedBy: { // NEW: Add this field to the schema
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true, // It's required in controller, so keep it required here
+  },
 }, {
   timestamps: true,
 });

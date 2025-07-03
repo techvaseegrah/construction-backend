@@ -1,4 +1,4 @@
-
+// construction/backend/controllers/projectController.js
 const asyncHandler = require('express-async-handler');
 const Site = require('../models/Site');
 const Worker = require('../models/Worker');
@@ -28,24 +28,34 @@ const getProjects = asyncHandler(async (req, res) => {
 // @route   GET /api/projects/:id
 // @access  Private (Admin/Supervisor - supervisors only their assigned)
 const getProjectById = asyncHandler(async (req, res) => {
+  console.log('Attempting to get project by ID:', req.params.id); // Keep this log for verification
+
   const project = await Site.findById(req.params.id)
-    .populate('supervisors', 'name username')
+    .populate('supervisors', 'name username') // This populates the 'supervisors' array
     .populate('assignedWorkers.workerId', 'name role rfidId');
 
-  if (project) {
-    // If supervisor, ensure they are assigned to this site
-    if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(project._id.toString())) {
+  if (!project) {
+    res.status(404).json({
+      message: 'Project not found'
+    });
+    return;
+  }
+
+  // If supervisor, ensure they are assigned to this site
+  if (req.user.role === 'supervisor') {
+    // CORRECTED LINE: Use project.supervisors instead of project.assignedSupervisor
+    const isAssignedToSupervisor = project.supervisors.some(
+      (supervisor) => supervisor._id.toString() === req.user._id.toString()
+    );
+
+    if (!isAssignedToSupervisor) {
       res.status(403).json({
         message: 'Not authorized to view this project'
       });
       return;
     }
-    res.json(project);
-  } else {
-    res.status(404).json({
-      message: 'Project not found'
-    });
   }
+  res.json(project);
 });
 
 // @desc    Create a new project/site
@@ -233,7 +243,8 @@ const updateProject = asyncHandler(async (req, res) => {
                 'assignedProjects.$.projectSalary': newWorkerEntry.salaryOverride,
                 'assignedProjects.$.siteName': project.name
               }
-            });
+            }
+          );
           }
         } else {
           // Add new worker assignment to project
@@ -260,6 +271,7 @@ const updateProject = asyncHandler(async (req, res) => {
       project.assignedWorkers = assignedWorkers;
     }
 
+
     const updatedProject = await project.save();
     res.json(updatedProject);
 
@@ -274,52 +286,103 @@ const updateProject = asyncHandler(async (req, res) => {
 // @route   DELETE /api/projects/:id
 // @access  Private (Admin only)
 const deleteProject = asyncHandler(async (req, res) => {
+  console.log(`Attempting to delete project with ID: ${req.params.id}`);
+
   const project = await Site.findById(req.params.id);
 
   if (project) {
-    // Remove project from supervisors' assignedSites
-    await User.updateMany({
-      assignedSites: project._id
-    }, {
-      $pull: {
+    console.log(`Found project: ${project.name}. Initiating cascading deletes.`);
+
+    try {
+      // Remove project from supervisors' assignedSites
+      await User.updateMany({
         assignedSites: project._id
-      }
-    });
-
-    // Remove project from workers' assignedProjects
-    await Worker.updateMany({
-      'assignedProjects.siteId': project._id
-    }, {
-      $pull: {
-        assignedProjects: {
-          siteId: project._id
+      }, {
+        $pull: {
+          assignedSites: project._id
         }
-      }
-    });
+      });
+      console.log('Removed project from supervisors.');
+    } catch (error) {
+      console.error('Error removing project from supervisors:', error);
+      // Don't return, try to proceed with other deletions if possible, or decide strictness
+    }
 
-    // Also delete associated attendance, material, activity, salary logs
-    await AttendanceEntry.deleteMany({
-      siteId: project._id
-    });
-    await MaterialEntry.deleteMany({
-      siteId: project._id
-    });
-    await ActivityLog.deleteMany({
-      siteId: project._id
-    });
-    await AdvanceEntry.deleteMany({
-      siteId: project._id
-    });
-    await SalaryLog.deleteMany({
-      siteId: project._id
-    });
+    try {
+      // Remove project from workers' assignedProjects
+      await Worker.updateMany({
+        'assignedProjects.siteId': project._id
+      }, {
+        $pull: {
+          assignedProjects: {
+            siteId: project._id
+          }
+        }
+      });
+      console.log('Removed project from workers.');
+    } catch (error) {
+      console.error('Error removing project from workers:', error);
+    }
 
+    try {
+      // Also delete associated attendance, material, activity, salary logs
+      await AttendanceEntry.deleteMany({
+        siteId: project._id
+      });
+      console.log('Deleted associated attendance entries.');
+    } catch (error) {
+      console.error('Error deleting attendance entries:', error);
+    }
 
-    await project.deleteOne();
-    res.json({
-      message: 'Project removed'
-    });
+    try {
+      await MaterialEntry.deleteMany({
+        siteId: project._id
+      });
+      console.log('Deleted associated material entries.');
+    } catch (error) {
+      console.error('Error deleting material entries:', error);
+    }
+
+    try {
+      await ActivityLog.deleteMany({
+        siteId: project._id
+      });
+      console.log('Deleted associated activity logs.');
+    } catch (error) {
+      console.error('Error deleting activity logs:', error);
+    }
+
+    try {
+      await AdvanceEntry.deleteMany({
+        siteId: project._id
+      });
+      console.log('Deleted associated advance entries.');
+    } catch (error) {
+      console.error('Error deleting advance entries:', error);
+    }
+
+    try {
+      await SalaryLog.deleteMany({
+        siteId: project._id
+      });
+      console.log('Deleted associated salary logs.');
+    } catch (error) {
+      console.error('Error deleting salary logs:', error);
+    }
+
+    try {
+      await project.deleteOne(); // Finally delete the project itself
+      console.log(`Project ${project.name} (ID: ${project._id}) removed successfully.`);
+      res.json({
+        message: 'Project removed'
+      });
+    } catch (error) {
+      console.error('Error deleting the project document itself:', error);
+      res.status(500).json({ message: 'Failed to delete project document.', error: error.message });
+    }
+
   } else {
+    console.log(`Project with ID ${req.params.id} not found for deletion.`);
     res.status(404).json({
       message: 'Project not found'
     });

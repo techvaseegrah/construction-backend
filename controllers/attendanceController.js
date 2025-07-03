@@ -1,7 +1,9 @@
+// construction/backend/controllers/attendanceController.js
 const asyncHandler = require('express-async-handler');
 const AttendanceEntry = require('../models/AttendanceEntry');
 const Worker = require('../models/Worker');
 const Site = require('../models/Site');
+const mongoose = require('mongoose'); // Import mongoose for ObjectId if needed for comparison later, though toString() is safer.
 
 // Helper to get multiplier based on shiftType
 const getMultiplier = (shiftType) => {
@@ -90,16 +92,15 @@ const markAttendance = asyncHandler(async (req, res) => {
 // @access  Private (Admin/Supervisor)
 const getAttendanceEntries = asyncHandler(async (req, res) => {
   const {
-    siteId,
+    siteId, // This is the siteId passed from the frontend (from URL or dropdown)
     workerId,
     startDate,
     endDate
   } = req.query;
-  let query = {};
 
-  if (siteId) {
-    query.siteId = siteId;
-  }
+  let query = {}; // Initialize an empty query object
+
+  // Step 1: Apply filters from query parameters
   if (workerId) {
     query.workerId = workerId;
   }
@@ -110,19 +111,32 @@ const getAttendanceEntries = asyncHandler(async (req, res) => {
     };
   }
 
-  // If supervisor, filter by assigned sites
+  // Step 2: Apply site filtering based on user role and provided siteId
   if (req.user.role === 'supervisor') {
-    const assignedSites = req.user.assignedSites;
-    if (query.siteId && !assignedSites.includes(query.siteId)) {
-      res.status(403).json({
-        message: 'Not authorized to view attendance for this site'
-      });
-      return;
+    const assignedSites = req.user.assignedSites.map(id => id.toString()); // Convert IDs to strings for easy comparison
+
+    if (siteId) {
+      // If a specific siteId is requested by the frontend for a supervisor,
+      // FIRST, check if the supervisor is assigned to this site.
+      if (!assignedSites.includes(siteId)) {
+        res.status(403).json({ message: 'Not authorized to view attendance for this site' });
+        return;
+      }
+      // If authorized, explicitly set the query to this specific siteId.
+      query.siteId = siteId;
+    } else {
+      // If no specific siteId is requested (e.g., from sidebar direct access),
+      // then show attendance for all assigned sites for this supervisor.
+      query.siteId = { $in: assignedSites };
     }
-    query.siteId = {
-      $in: assignedSites
-    };
+  } else if (siteId) {
+    // If admin and a specific siteId is requested, apply that filter.
+    // Admins can see all sites, so no authorization check needed beyond the route protection.
+    query.siteId = siteId;
   }
+  // If admin and no siteId is requested, 'query.siteId' remains undefined,
+  // meaning the query will fetch attendance from all sites (which is the desired admin's default).
+
 
   const attendanceEntries = await AttendanceEntry.find(query)
     .populate('workerId', 'name role')

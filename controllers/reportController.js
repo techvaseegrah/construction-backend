@@ -1,341 +1,504 @@
+// construction/backend/controllers/reportController.js
 const asyncHandler = require('express-async-handler');
 const Site = require('../models/Site');
-const Worker = require('../models/Worker');
 const AttendanceEntry = require('../models/AttendanceEntry');
-const AdvanceEntry = require('../models/AdvanceEntry');
 const MaterialEntry = require('../models/MaterialEntry');
 const ActivityLog = require('../models/ActivityLog');
+const AdvanceEntry = require('../models/AdvanceEntry');
 const SalaryLog = require('../models/SalaryLog');
+const User = require('../models/User');
+const Worker = require('../models/Worker');
+const { generatePdfReport } = require('../utils/generatePdf');
 const mongoose = require('mongoose');
-const {
-  generatePdfReport
-} = require('../utils/generatePdf'); // Assuming this exists
+const ExcelJS = require('exceljs');
 
-// Helper to calculate start and end of week (Sunday to Saturday)
-const getWeekRange = (date) => {
-  const d = new Date(date);
-  d.setUTCHours(0, 0, 0, 0);
-  const day = d.getUTCDay(); // 0 for Sunday, 6 for Saturday
-  const diff = d.getUTCDate() - day; // adjust when day is sunday
-  const weekStart = new Date(d.setUTCDate(diff));
-  const weekEnd = new Date(d.setUTCDate(diff + 6));
-  weekEnd.setUTCHours(23, 59, 59, 999);
-  return {
-    weekStart,
-    weekEnd
+// Helper to get total multiplier (attendance days) for a worker in a date range
+const getWorkerAttendanceSummary = async (workerId, siteId, startDate, endDate) => {
+  const matchQuery = {
+    workerId: new mongoose.Types.ObjectId(workerId),
+    siteId: new mongoose.Types.ObjectId(siteId),
+    date: { $gte: startDate, $lte: endDate }
   };
+  const result = await AttendanceEntry.aggregate([
+    { $match: matchQuery },
+    { $group: { _id: null, totalMultiplier: { $sum: '$multiplier' } } }
+  ]);
+  return result.length > 0 ? result[0].totalMultiplier : 0;
 };
 
-// @desc    Generate a comprehensive report for a site or all sites
+
+// @desc    Generate a report
 // @route   GET /api/reports/generate
 // @access  Private (Admin/Supervisor)
 const generateReport = asyncHandler(async (req, res) => {
-  const {
-    siteId,
-    startDate,
-    endDate,
-    type = 'summary'
-  } = req.query; // type could be 'summary', 'attendance', 'materials', 'salary', 'activity'
+  const { siteId, startDate, endDate, format } = req.query;
 
-  let query = {};
-  if (siteId) {
-    query._id = siteId;
-  }
+  console.log('--- generateReport started ---');
+  console.log('Received siteId:', siteId, 'startDate:', startDate, 'endDate:', endDate, 'format:', format);
 
-  // If supervisor, restrict to their assigned sites
+  let querySiteId = siteId;
+
   if (req.user.role === 'supervisor') {
-    const assignedSites = req.user.assignedSites;
-    if (query._id && !assignedSites.includes(query._id.toString())) {
-      res.status(403).json({
-        message: 'Not authorized to generate reports for this site'
-      });
-      return;
+    const assignedSites = req.user.assignedSites.map(id => id.toString());
+    console.log('Supervisor assigned sites:', assignedSites);
+
+    if (querySiteId) {
+      if (!assignedSites.includes(querySiteId)) {
+        console.log('Supervisor NOT authorized for requested siteId:', querySiteId);
+        res.status(403).json({ message: 'Not authorized to generate report for this site' });
+        return;
+      }
+      querySiteId = querySiteId;
+      console.log('Supervisor authorized for specific siteId:', querySiteId);
+    } else {
+      querySiteId = { $in: assignedSites };
+      console.log('Supervisor generating report for all assigned sites:', querySiteId);
     }
-    query._id = {
-      $in: assignedSites
-    };
+  } else {
+      console.log('User is Admin. Querying with siteId:', querySiteId || 'all sites');
   }
 
-  const sites = await Site.find(query).populate('supervisors', 'name').populate('assignedWorkers.workerId', 'name role baseSalary');
-  if (sites.length === 0) {
-    res.status(404).json({
-      message: 'No sites found matching criteria'
-    });
+  const reportStartDate = startDate ? new Date(startDate) : new Date('1970-01-01T00:00:00.000Z');
+  const reportEndDate = endDate ? new Date(new Date(endDate).setUTCHours(23, 59, 59, 999)) : new Date();
+
+  if (isNaN(reportStartDate.getTime()) || isNaN(reportEndDate.getTime())) {
+    console.error('Invalid date received. Start:', startDate, 'End:', endDate);
+    res.status(400).json({ message: 'Invalid start or end date.' });
     return;
   }
+  console.log('Report Date Range:', reportStartDate.toISOString(), 'to', reportEndDate.toISOString());
 
-  const reportData = [];
+
+  let siteQuery = {};
+  if (querySiteId) {
+    if (typeof querySiteId === 'string') {
+      siteQuery._id = new mongoose.Types.ObjectId(querySiteId);
+    } else if (typeof querySiteId === 'object' && querySiteId.$in) {
+      siteQuery._id = { $in: querySiteId.$in.map(id => new mongoose.Types.ObjectId(id)) };
+    }
+  }
+  console.log('Final Site Query:', JSON.stringify(siteQuery));
+
+  const sites = await Site.find(siteQuery)
+    .populate('assignedWorkers.workerId', 'name role rfidId baseSalary assignedProjects')
+    .populate('supervisors', 'name');
+
+  if (sites.length === 0) {
+    console.log('No sites found for query:', JSON.stringify(siteQuery));
+    res.status(404).json({ message: 'No sites found matching criteria or you are not authorized.' });
+    return;
+  }
+  console.log('Found sites:', sites.map(s => s.name));
+
+  const finalReportData = [];
 
   for (const site of sites) {
-    let siteReport = {
+    console.log('Processing site:', site.name);
+    const siteReport = {
       siteName: site.name,
       siteLocation: site.location,
       startDate: site.startDate,
       supervisors: site.supervisors.map(s => s.name),
-      summary: {},
-      workers: [],
-      materials: [],
-      activities: [],
-      salaryLogs: [],
-      advances: [],
+      totalWorkersAssigned: site.assignedWorkers.length,
+      attendanceSummary: [],
+      materialSummary: [],
+      activityLogs: [],
+      advanceLogs: [],
+      salaryCalculations: [],
     };
 
-    const dateQuery = {};
-    if (startDate && endDate) {
-      dateQuery.date = {
-        $gte: new Date(startDate).setUTCHours(0, 0, 0, 0),
-        $lte: new Date(endDate).setUTCHours(23, 59, 59, 999)
-      };
-    }
-
-    // --- Site Summary ---
-    const totalMaterialCost = await MaterialEntry.aggregate([{
-      $match: {
-        siteId: site._id,
-        ...dateQuery
-      }
-    }, {
-      $group: {
-        _id: null,
-        total: {
-          $sum: '$total'
-        }
-      }
-    }, ]);
-    siteReport.summary.totalMaterialCost = totalMaterialCost.length > 0 ? totalMaterialCost[0].total : 0;
-
-    const totalAdvanceGiven = await AdvanceEntry.aggregate([{
-      $match: {
-        siteId: site._id,
-        ...dateQuery
-      }
-    }, {
-      $group: {
-        _id: null,
-        total: {
-          $sum: '$amount'
-        }
-      }
-    }, ]);
-    siteReport.summary.totalAdvanceGiven = totalAdvanceGiven.length > 0 ? totalAdvanceGiven[0].total : 0;
-
-    // --- Worker Salaries (Calculate for the period, if not already logged in SalaryLogs) ---
-    // If startDate and endDate are provided, calculate weekly salary for each week within the range
-    // and log it if not present, then fetch.
-    const allWorkersOnSite = await Worker.find({
-      'assignedProjects.siteId': site._id
-    });
-
-    for (const worker of allWorkersOnSite) {
-      const workerProjectAssignment = worker.assignedProjects.find(ap => ap.siteId.toString() === site._id.toString());
-      const dailyRate = workerProjectAssignment && workerProjectAssignment.projectSalary ?
-        workerProjectAssignment.projectSalary :
-        worker.baseSalary;
-
-      // Fetch all attendance for this worker on this site within the date range
-      const attendanceForWorker = await AttendanceEntry.find({
-        workerId: worker._id,
-        siteId: site._id,
-        ...dateQuery
-      });
-
-      const totalAttendanceDays = attendanceForWorker.reduce((sum, entry) => sum + entry.multiplier, 0);
-
-      // Fetch advances for this worker on this site within the date range
-      const advancesForWorker = await AdvanceEntry.find({
-        workerId: worker._id,
-        siteId: site._id,
-        ...dateQuery
-      });
-      const totalAdvanceDeducted = advancesForWorker.reduce((sum, entry) => sum + entry.amount, 0);
-
-      const grossSalary = totalAttendanceDays * dailyRate;
-      const netSalary = grossSalary - totalAdvanceDeducted;
-
-      siteReport.workers.push({
-        workerId: worker._id,
-        workerName: worker.name,
-        workerRole: worker.role,
-        dailyRate: dailyRate,
-        totalAttendanceDays: totalAttendanceDays,
-        grossSalary: grossSalary,
-        totalAdvanceDeducted: totalAdvanceDeducted,
-        netSalary: netSalary,
-        attendanceDetails: attendanceForWorker.map(att => ({
-          date: att.date,
-          shiftType: att.shiftType,
-          multiplier: att.multiplier
-        })),
-        advanceDetails: advancesForWorker.map(adv => ({
-          date: adv.date,
-          amount: adv.amount,
-          reason: adv.reason
-        }))
-      });
-    }
-
-    // --- Material Cost ---
-    siteReport.materials = await MaterialEntry.find({
+    console.log('Fetching raw material logs for site:', site.name);
+    const materials = await MaterialEntry.find({
       siteId: site._id,
-      ...dateQuery
+      date: { $gte: reportStartDate, $lte: reportEndDate }
     }).populate('recordedBy', 'name');
+    siteReport.materialSummary = materials.map(m => ({
+      material: m.material,
+      brand: m.brand,
+      quantity: m.quantity,
+      unit: m.unit,
+      pricePerUnit: m.pricePerUnit,
+      totalCost: m.total,
+      date: m.date,
+      recordedBy: m.recordedBy
+    }));
+    const totalMaterialCost = materials.reduce((sum, m) => sum + m.total, 0);
+    console.log('Material Summary collected.');
 
-    // --- Activity Logs ---
-    siteReport.activities = await ActivityLog.find({
+
+    console.log('Fetching advance logs for site:', site.name);
+    const advances = await AdvanceEntry.find({
       siteId: site._id,
-      ...dateQuery
+      date: { $gte: reportStartDate, $lte: reportEndDate }
+    }).populate('workerId', 'name role').populate('recordedBy', 'name');
+    siteReport.advanceLogs = advances.map(a => ({
+      workerId: a.workerId,
+      amount: a.amount,
+      date: a.date,
+      reason: a.reason,
+      recordedBy: a.recordedBy
+    }));
+    const totalAdvanceGiven = advances.reduce((sum, a) => sum + a.amount, 0);
+    console.log('Advance Logs collected.');
+
+    siteReport.summary = {
+        totalMaterialCost: totalMaterialCost,
+        totalAdvanceGiven: totalAdvanceGiven,
+    };
+    console.log('Overall Site Summary collected.');
+
+    console.log('Fetching attendance and calculating salaries for site:', site.name);
+    for (const workerAssignment of site.assignedWorkers) {
+        if (!workerAssignment.workerId) {
+            console.warn(`Worker ID missing for assignment in site ${site.name}:`, workerAssignment);
+            continue;
+        }
+        const worker = workerAssignment.workerId;
+        const totalAttendanceDays = await getWorkerAttendanceSummary(
+            worker._id,
+            site._id,
+            reportStartDate,
+            reportEndDate
+        );
+
+        const workerSpecificAdvance = siteReport.advanceLogs.filter(adv =>
+            adv.workerId?._id.toString() === worker._id.toString()
+        ).reduce((sum, adv) => sum + adv.amount, 0);
+
+        const dailyRateUsed = workerAssignment.salaryOverride || worker.baseSalary || 0;
+        const grossSalary = totalAttendanceDays * dailyRateUsed;
+        const netSalary = grossSalary - workerSpecificAdvance;
+
+        siteReport.salaryCalculations.push({
+            workerName: worker.name,
+            workerRole: worker.role,
+            rfidId: worker.rfidId,
+            totalAttendanceDays: totalAttendanceDays,
+            dailyRateUsed: dailyRateUsed,
+            grossSalary: grossSalary,
+            totalAdvance: workerSpecificAdvance,
+            netSalary: netSalary,
+            workerId: worker._id
+        });
+    }
+    console.log('Salary calculations complete for site:', site.name);
+
+    console.log('Fetching activity logs for site:', site.name);
+    const activities = await ActivityLog.find({
+      siteId: site._id,
+      date: { $gte: reportStartDate, $lte: reportEndDate }
     }).populate('supervisorId', 'name');
+    siteReport.activityLogs = activities.map(a => ({
+      date: a.date,
+      message: a.message,
+      supervisorId: a.supervisorId
+    }));
+    console.log('Activity Logs collected.');
 
-    // --- Salary Logs (already computed weekly salaries) ---
-    siteReport.salaryLogs = await SalaryLog.find({
-      siteId: site._id,
-      weekStart: dateQuery.date ? dateQuery.date.$gte : {
-        $exists: true
-      },
-      weekEnd: dateQuery.date ? dateQuery.date.$lte : {
-        $exists: true
-      },
-    }).populate('workerId', 'name role');
-
-    // --- Advance Logs ---
-    siteReport.advances = await AdvanceEntry.find({
-      siteId: site._id,
-      ...dateQuery
-    }).populate('workerId', 'name').populate('recordedBy', 'name');
-
-
-    reportData.push(siteReport);
+    finalReportData.push(siteReport);
+    console.log('Finished processing site:', site.name);
   }
 
-  // Determine output format
-  if (req.query.format === 'pdf') {
-    // Generate PDF (assuming generatePdfReport handles this)
-    const pdfBuffer = await generatePdfReport(reportData); // This function needs to be implemented
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename=contractor_report.pdf');
-    res.send(pdfBuffer);
-  } else if (req.query.format === 'excel') {
-    // Generate Excel (needs a library like 'exceljs' or 'json2csv')
-    // For simplicity, we'll return JSON for now and mention excel generation
-    res.status(501).json({
-      message: 'Excel export not yet implemented. Please try PDF or JSON.',
-      reportData
-    });
+  console.log('All report data compiled. Format:', format);
+
+  if (format === 'pdf') {
+    try {
+      console.log('Attempting PDF generation...');
+      const pdfBuffer = await generatePdfReport(finalReportData);
+      console.log('PDF generation successful.');
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename=report_${siteId || 'all_sites'}_${reportStartDate.toISOString().slice(0,10)}.pdf`);
+      res.send(pdfBuffer);
+    } catch (pdfError) {
+      console.error('Error during PDF generation:', pdfError);
+      console.error('PDF Error Stack:', pdfError.stack);
+      res.status(500).json({ message: 'Error generating PDF report.', error: pdfError.message });
+    }
+  } else if (format === 'excel') {
+    try {
+        const workbook = new ExcelJS.Workbook();
+        finalReportData.forEach((siteReport) => {
+          const sheet = workbook.addWorksheet(`${siteReport.siteName}`);
+          sheet.addRow(['Report for Site:', siteReport.siteName]);
+          sheet.addRow(['Location:', siteReport.siteLocation]);
+          sheet.addRow(['Start Date:', siteReport.startDate.toLocaleDateString()]);
+          sheet.addRow(['Supervisors:', siteReport.supervisors.join(', ')]);
+          sheet.addRow(['Total Workers Assigned:', siteReport.totalWorkersAssigned]);
+          sheet.addRow([]);
+
+          sheet.addRow(['Overall Summary']);
+          sheet.addRow(['Total Material Cost', 'Total Advance Given']);
+          sheet.addRow([`₹${siteReport.summary.totalMaterialCost.toFixed(2)}`, `₹${siteReport.summary.totalAdvanceGiven.toFixed(2)}`]);
+          sheet.addRow([]);
+
+          sheet.addRow(['Worker Salary Calculations']);
+          sheet.addRow(['Worker Name', 'Role', 'RFID ID', 'Total Attendance Days', 'Daily Rate Used', 'Gross Salary', 'Total Advance', 'Net Salary']);
+          siteReport.salaryCalculations.forEach(sal => {
+            sheet.addRow([
+              sal.workerName,
+              sal.workerRole,
+              sal.rfidId,
+              sal.totalAttendanceDays,
+              `₹${sal.dailyRateUsed.toFixed(2)}`,
+              `₹${sal.grossSalary.toFixed(2)}`,
+              `₹${sal.totalAdvance.toFixed(2)}`,
+              `₹${sal.netSalary.toFixed(2)}`
+            ]);
+          });
+          sheet.addRow([]);
+
+          sheet.addRow(['Material Summary']);
+          sheet.addRow(['Material', 'Brand', 'Quantity', 'Unit', 'Price/Unit', 'Total Cost', 'Date', 'Recorded By']);
+          siteReport.materialSummary.forEach(mat => {
+            sheet.addRow([mat.material, mat.brand, mat.quantity, mat.unit, `₹${mat.pricePerUnit.toFixed(2)}`, `₹${mat.totalCost.toFixed(2)}`, mat.date.toLocaleDateString(), mat.recordedBy?.name || 'N/A']);
+          });
+          sheet.addRow([]);
+
+          sheet.addRow(['Activity Logs']);
+          sheet.addRow(['Date', 'Message', 'Supervisor']);
+          siteReport.activityLogs.forEach(act => {
+            sheet.addRow([act.date.toLocaleDateString(), act.message, act.supervisorId?.name || 'N/A']);
+          });
+          sheet.addRow([]);
+
+          sheet.addRow(['Advance Logs']);
+          sheet.addRow(['Worker Name', 'Amount', 'Date', 'Reason', 'Recorded By']);
+          siteReport.advanceLogs.forEach(adv => {
+            sheet.addRow([adv.workerId?.name || 'N/A', `₹${adv.amount.toFixed(2)}`, adv.date.toLocaleDateString(), adv.reason, adv.recordedBy?.name || 'N/A']);
+          });
+          sheet.addRow([]);
+        });
+
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=report_${siteId || 'all_sites'}_${reportStartDate.toISOString().slice(0,10)}.xlsx`);
+        await workbook.xlsx.write(res);
+        res.end();
+        console.log('Excel generation successful.');
+    } catch (excelError) {
+        console.error('Error during Excel generation:', excelError);
+        console.error('Excel Error Stack:', excelError.stack);
+        res.status(500).json({ message: 'Error generating Excel report.', error: excelError.message });
+    }
   } else {
-    res.json(reportData);
+    res.json({ message: 'Report generated successfully!', reportData: finalReportData });
+    console.log('JSON report generated.');
   }
 });
 
-
-// @desc    Calculate and log weekly salaries (can be run via cron or manually by admin)
+// @desc    Calculate and log weekly salaries for all workers across all sites
 // @route   POST /api/reports/calculate-weekly-salaries
 // @access  Private (Admin only)
 const calculateAndLogWeeklySalaries = asyncHandler(async (req, res) => {
-  const {
-    date
-  } = req.body; // Date within the week to calculate for
-  const calculationDate = date ? new Date(date) : new Date();
+  const { startDate, endDate, siteId } = req.body;
 
-  const {
-    weekStart,
-    weekEnd
-  } = getWeekRange(calculationDate);
+  if (!startDate || !endDate) {
+    res.status(400).json({ message: 'Start date and end date are required for salary calculation.' });
+    return;
+  }
 
-  const workers = await Worker.find({}); // Get all workers
-  const sites = await Site.find({}); // Get all sites
+  const startOfWeek = new Date(startDate);
+  startOfWeek.setUTCHours(0, 0, 0, 0);
+  const endOfWeek = new Date(endDate);
+  endOfWeek.setUTCHours(23, 59, 59, 999);
 
-  const newSalaryLogs = [];
+  let siteQuery = {};
+  if (siteId) {
+    siteQuery._id = new mongoose.Types.ObjectId(siteId);
+  }
 
-  for (const worker of workers) {
-    for (const assignedProject of worker.assignedProjects) {
-      const siteId = assignedProject.siteId;
-      const siteName = assignedProject.siteName;
-      const projectSalaryOverride = assignedProject.projectSalary;
+  const sites = await Site.find(siteQuery)
+    .populate('assignedWorkers.workerId', 'name baseSalary assignedProjects');
 
-      const dailyRate = projectSalaryOverride || worker.baseSalary;
+  if (sites.length === 0) {
+    res.status(404).json({ message: 'No sites found for salary calculation.' });
+    return;
+  }
 
-      // Get attendance for the week for this worker on this site
-      const attendanceThisWeek = await AttendanceEntry.find({
+  const salaryLogsToSave = [];
+  const calculatedSalaries = [];
+
+  let recordedById;
+  if (req.user._id === 'dev_admin_id' || req.user._id === 'dev_supervisor_id') {
+      recordedById = new mongoose.Types.ObjectId('60a7b1b3c9f2b1001a4e2d3c');
+  } else {
+      recordedById = req.user._id;
+  }
+
+
+  for (const site of sites) {
+    for (const workerAssignment of site.assignedWorkers) {
+      const worker = workerAssignment.workerId;
+      if (!worker) continue;
+
+      const totalAttendanceDays = await getWorkerAttendanceSummary(
+        worker._id,
+        site._id,
+        startOfWeek,
+        endOfWeek
+      );
+
+      const workerAdvances = await AdvanceEntry.find({
         workerId: worker._id,
-        siteId: siteId,
-        date: {
-          $gte: weekStart,
-          $lte: weekEnd
-        }
+        siteId: site._id,
+        date: { $gte: startOfWeek, $lte: endOfWeek }
       });
+      const totalAdvanceDeducted = workerAdvances.reduce((sum, adv) => sum + adv.amount, 0);
 
-      if (attendanceThisWeek.length === 0) {
-        continue; // No attendance for this worker on this site this week
-      }
-
-      const totalAttendanceDays = attendanceThisWeek.reduce((sum, entry) => sum + entry.multiplier, 0);
+      const dailyRate = workerAssignment.salaryOverride || worker.baseSalary || 0;
       const grossSalary = totalAttendanceDays * dailyRate;
-
-      // Get advances for the week for this worker on this site
-      const advancesThisWeek = await AdvanceEntry.find({
-        workerId: worker._id,
-        siteId: siteId,
-        date: {
-          $gte: weekStart,
-          $lte: weekEnd
-        }
-      });
-      const totalAdvanceDeducted = advancesThisWeek.reduce((sum, entry) => sum + entry.amount, 0);
-
       const netSalary = grossSalary - totalAdvanceDeducted;
 
-      // Check if a salary log for this worker, site, and week already exists
-      const existingSalaryLog = await SalaryLog.findOne({
-        workerId: worker._id,
-        siteId: siteId,
-        weekStart: weekStart,
-        weekEnd: weekEnd,
+      // Check if a salary log already exists for this worker, site, and week
+      const existingLog = await SalaryLog.findOne({
+          workerId: worker._id,
+          siteId: site._id,
+          weekStart: startOfWeek,
+          weekEnd: endOfWeek
       });
 
-      if (existingSalaryLog) {
-        // Update existing log
-        existingSalaryLog.totalAttendanceDays = totalAttendanceDays;
-        existingSalaryLog.shiftDetails = attendanceThisWeek.map(att => ({
-          date: att.date,
-          shiftType: att.shiftType,
-          multiplier: att.multiplier
-        }));
-        existingSalaryLog.dailyRateUsed = dailyRate;
-        existingSalaryLog.grossSalary = grossSalary;
-        existingSalaryLog.totalAdvanceDeducted = totalAdvanceDeducted;
-        existingSalaryLog.netSalary = netSalary;
-        await existingSalaryLog.save();
-        newSalaryLogs.push(existingSalaryLog);
+      if (existingLog) {
+          // If it exists, update it instead of creating a duplicate
+          existingLog.totalAttendanceDays = totalAttendanceDays;
+          existingLog.dailyRateUsed = dailyRate;
+          existingLog.grossSalary = grossSalary;
+          existingLog.totalAdvanceDeducted = totalAdvanceDeducted;
+          existingLog.netSalary = netSalary;
+          // Only update recordedBy if it's currently null or if it's a dev user
+          if (!existingLog.recordedBy || existingLog.recordedBy.toString() === '60a7b1b3c9f2b1001a4e2d3c') {
+              existingLog.recordedBy = recordedById;
+          }
+          await existingLog.save();
+          console.log(`Updated existing salary log for worker ${worker.name} at site ${site.name} for week ${startOfWeek.toLocaleDateString()}`);
       } else {
-        // Create new salary log
-        const salaryLog = await SalaryLog.create({
-          workerId: worker._id,
-          siteId: siteId,
-          weekStart: weekStart,
-          weekEnd: weekEnd,
-          totalAttendanceDays: totalAttendanceDays,
-          shiftDetails: attendanceThisWeek.map(att => ({
-            date: att.date,
-            shiftType: att.shiftType,
-            multiplier: att.multiplier
-          })),
-          dailyRateUsed: dailyRate,
-          grossSalary: grossSalary,
-          totalAdvanceDeducted: totalAdvanceDeducted,
-          netSalary: netSalary,
-        });
-        newSalaryLogs.push(salaryLog);
+          // Create new log if it doesn't exist
+          salaryLogsToSave.push({
+            workerId: worker._id,
+            siteId: site._id,
+            weekStart: startOfWeek,
+            weekEnd: endOfWeek,
+            totalAttendanceDays: totalAttendanceDays,
+            dailyRateUsed: dailyRate,
+            grossSalary: grossSalary,
+            totalAdvanceDeducted: totalAdvanceDeducted,
+            netSalary: netSalary,
+            paid: false,
+            paymentDate: null,
+            recordedBy: recordedById,
+          });
       }
+
+      calculatedSalaries.push({
+        workerName: worker.name,
+        siteName: site.name,
+        weekStart: startOfWeek.toLocaleDateString(),
+        weekEnd: endOfWeek.toLocaleDateString(),
+        attendanceDays: totalAttendanceDays,
+        grossSalary: grossSalary,
+        advanceDeducted: totalAdvanceDeducted,
+        netSalary: netSalary,
+        paid: existingLog ? existingLog.paid : false // Retain paid status if updating existing
+      });
     }
   }
 
-  res.json({
-    message: `Weekly salaries calculated and logged/updated for the week ${weekStart.toISOString().split('T')[0]} - ${weekEnd.toISOString().split('T')[0]}`,
-    loggedSalaries: newSalaryLogs,
+  // Only create new logs that were pushed to salaryLogsToSave
+  if (salaryLogsToSave.length > 0) {
+    await SalaryLog.insertMany(salaryLogsToSave); // Use insertMany for efficiency
+  }
+
+  res.status(200).json({
+    message: 'Weekly salaries calculated and logged successfully.',
+    calculatedSalaries: calculatedSalaries
   });
 });
+
+
+// @desc    Get Salary Logs (for Admin/Supervisor)
+// @route   GET /api/reports/salary-logs
+// @access  Private (Admin/Supervisor)
+const getSalaryLogs = asyncHandler(async (req, res) => {
+  const { siteId, workerId, startDate, endDate, paidStatus } = req.query;
+  let query = {};
+
+  if (siteId) {
+    query.siteId = siteId;
+  }
+  if (workerId) {
+    query.workerId = workerId;
+  }
+  if (startDate && endDate) {
+    query.weekStart = { $gte: new Date(startDate).setUTCHours(0, 0, 0, 0) };
+    query.weekEnd = { $lte: new Date(endDate).setUTCHours(23, 59, 59, 999) };
+  }
+  if (paidStatus !== undefined && paidStatus !== null && paidStatus !== '') {
+    query.paid = paidStatus === 'true';
+  }
+
+  if (req.user.role === 'supervisor') {
+    const assignedSites = req.user.assignedSites.map(id => id.toString());
+    if (query.siteId && !assignedSites.includes(query.siteId.toString())) {
+      res.status(403).json({ message: 'Not authorized to view salary logs for this site' });
+      return;
+    }
+    if (!query.siteId) {
+      query.siteId = { $in: assignedSites };
+    }
+  }
+
+  const salaryLogs = await SalaryLog.find(query)
+    .populate('workerId', 'name role')
+    .populate('siteId', 'name')
+    .populate('recordedBy', 'name');
+
+  res.json(salaryLogs);
+});
+
+// @desc    Update Salary Log Paid Status
+// @route   PUT /api/reports/salary-logs/:id/paid
+// @access  Private (Admin only)
+const updateSalaryLogPaidStatus = asyncHandler(async (req, res) => {
+  const { paid, paymentDate } = req.body;
+  const salaryLogId = req.params.id;
+
+  const salaryLog = await SalaryLog.findById(salaryLogId);
+
+  if (!salaryLog) {
+    res.status(404).json({ message: 'Salary log not found' });
+    return;
+  }
+
+  try {
+    salaryLog.paid = paid;
+    salaryLog.paymentDate = paid ? (paymentDate || new Date()) : null;
+
+    // Determine recordedBy ID for the update: Use actual user ID if it's a valid ObjectId,
+    // otherwise, use a placeholder ObjectId for dev users to pass validation.
+    let recordedById;
+    if (req.user._id === 'dev_admin_id' || req.user._id === 'dev_supervisor_id') {
+        recordedById = new mongoose.Types.ObjectId('60a7b1b3c9f2b1001a4e2d3c'); // Use the same static dummy ObjectId
+    } else {
+        recordedById = req.user._id;
+    }
+
+    // Explicitly set recordedBy to ensure it's present and valid during save
+    // Only update if it's currently null/undefined or if it's the dummy ID
+    if (!salaryLog.recordedBy || salaryLog.recordedBy.toString() === '60a7b1b3c9f2b1001a4e2d3c') {
+        salaryLog.recordedBy = recordedById;
+    }
+
+
+    const updatedSalaryLog = await salaryLog.save();
+    res.json({ message: 'Salary log updated successfully', updatedSalaryLog });
+  } catch (error) {
+    console.error('Error saving updated salary log:', error);
+    res.status(500).json({ message: 'Failed to update salary log paid status.', error: error.message });
+  }
+});
+
 
 module.exports = {
   generateReport,
   calculateAndLogWeeklySalaries,
+  getSalaryLogs,
+  updateSalaryLogPaidStatus,
 };

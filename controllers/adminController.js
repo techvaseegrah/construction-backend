@@ -1,3 +1,4 @@
+// construction/backend/controllers/adminController.js
 const asyncHandler = require('express-async-handler');
 const User = require('../models/User');
 const Site = require('../models/Site');
@@ -7,19 +8,22 @@ const AdvanceEntry = require('../models/AdvanceEntry');
 const MaterialEntry = require('../models/MaterialEntry');
 const ActivityLog = require('../models/ActivityLog');
 const SalaryLog = require('../models/SalaryLog');
+const mongoose = require('mongoose');
 
-// @desc    Get Admin Dashboard Summary
+// @desc    Get Admin Dashboard Overall Summary
 // @route   GET /api/admin/dashboard-summary
 // @access  Private/Admin
 const getAdminDashboardSummary = asyncHandler(async (req, res) => {
   const totalProjects = await Site.countDocuments();
   const totalWorkers = await Worker.countDocuments();
-  const totalSupervisors = await User.countDocuments({
-    role: 'supervisor'
-  });
 
-  // Example: Total material cost across all sites
-  const totalMaterialCost = await MaterialEntry.aggregate([{
+  // NEW: Fetch detailed list of supervisors
+  const supervisorsList = await User.find({ role: 'supervisor' })
+    .select('name username email assignedSites') // Select relevant fields
+    .populate('assignedSites', 'name'); // Populate assigned site names
+  const totalSupervisors = supervisorsList.length; // Count from the fetched list
+
+  const totalMaterialCostResult = await MaterialEntry.aggregate([{
     $group: {
       _id: null,
       total: {
@@ -27,8 +31,20 @@ const getAdminDashboardSummary = asyncHandler(async (req, res) => {
       }
     }
   }]);
+  const totalMaterialCost = totalMaterialCostResult.length > 0 ? totalMaterialCostResult[0].total : 0;
 
-  // Example: Recent activities
+  const totalSalaryCostResult = await SalaryLog.aggregate([{
+    $group: {
+      _id: null,
+      total: {
+        $sum: '$netSalary'
+      }
+    }
+  }]);
+  const totalSalaryCost = totalSalaryCostResult.length > 0 ? totalSalaryCostResult[0].total : 0;
+
+  const overallTotalCost = totalMaterialCost + totalSalaryCost;
+
   const recentActivities = await ActivityLog.find({})
     .sort({
       date: -1
@@ -42,9 +58,60 @@ const getAdminDashboardSummary = asyncHandler(async (req, res) => {
     totalProjects,
     totalWorkers,
     totalSupervisors,
-    totalMaterialCost: totalMaterialCost.length > 0 ? totalMaterialCost[0].total : 0,
+    supervisorsList, // NEW: Include the detailed list of supervisors in the response
+    totalMaterialCost,
+    totalSalaryCost,
+    overallTotalCost,
     recentActivities,
   });
+});
+
+
+// @desc    Get Admin Dashboard Project-wise Summaries
+// @route   GET /api/admin/project-summaries
+// @access  Private/Admin
+const getAdminProjectSummaries = asyncHandler(async (req, res) => {
+    // Get all sites (projects)
+    const projects = await Site.find({}).select('_id name location startDate');
+
+    const projectSummaries = [];
+
+    for (const project of projects) {
+        // Count workers assigned to this project
+        const workersAssignedCount = await Worker.countDocuments({
+            'assignedProjects.siteId': project._id
+        });
+
+        // Calculate total material cost for this project
+        const projectMaterialCostResult = await MaterialEntry.aggregate([
+            { $match: { siteId: project._id } },
+            { $group: { _id: null, total: { $sum: '$total' } } }
+        ]);
+        const projectMaterialCost = projectMaterialCostResult.length > 0 ? projectMaterialCostResult[0].total : 0;
+
+        // Calculate total salary cost for this project
+        const projectSalaryCostResult = await SalaryLog.aggregate([
+            { $match: { siteId: project._id } },
+            { $group: { _id: null, total: { $sum: '$netSalary' } } }
+        ]);
+        const projectSalaryCost = projectSalaryCostResult.length > 0 ? projectSalaryCostResult[0].total : 0;
+
+        // Calculate overall cost for this project
+        const projectOverallCost = projectMaterialCost + projectSalaryCost;
+
+        projectSummaries.push({
+            _id: project._id,
+            name: project.name,
+            location: project.location,
+            startDate: project.startDate,
+            totalWorkers: workersAssignedCount,
+            totalMaterialCost: projectMaterialCost,
+            totalSalaryCost: projectSalaryCost,
+            overallCost: projectOverallCost,
+        });
+    }
+
+    res.json(projectSummaries);
 });
 
 
@@ -123,5 +190,6 @@ const assignSitesToSupervisor = asyncHandler(async (req, res) => {
 
 module.exports = {
   getAdminDashboardSummary,
+  getAdminProjectSummaries,
   assignSitesToSupervisor,
 };

@@ -1,7 +1,9 @@
+// construction/backend/controllers/activityController.js
 const asyncHandler = require('express-async-handler');
 const ActivityLog = require('../models/ActivityLog');
 const Site = require('../models/Site');
 const User = require('../models/User');
+const mongoose = require('mongoose'); // Import mongoose to use mongoose.Types.ObjectId
 
 // @desc    Log daily activity
 // @route   POST /api/activities/log
@@ -30,9 +32,18 @@ const logActivity = asyncHandler(async (req, res) => {
     return;
   }
 
+  // Determine supervisorId: Use actual user ID if it's a valid ObjectId,
+  // otherwise, use a placeholder ObjectId for dev users to pass validation.
+  let actualSupervisorId;
+  if (req.user._id === 'dev_admin_id' || req.user._id === 'dev_supervisor_id') {
+      actualSupervisorId = new mongoose.Types.ObjectId('60a7b1b3c9f2b1001a4e2d3e'); // A static dummy ObjectId
+  } else {
+      actualSupervisorId = req.user._id; // Use the actual user's ObjectId
+  }
+
   const activityLog = await ActivityLog.create({
     siteId,
-    supervisorId: req.user._id,
+    supervisorId: actualSupervisorId, // Use the determined ID
     date: date || Date.now(),
     message,
   });
@@ -45,15 +56,12 @@ const logActivity = asyncHandler(async (req, res) => {
 // @access  Private (Admin/Supervisor)
 const getActivityLogs = asyncHandler(async (req, res) => {
   const {
-    siteId,
+    siteId, // This comes from the frontend, for the currently selected project
     startDate,
     endDate
   } = req.query;
   let query = {};
 
-  if (siteId) {
-    query.siteId = siteId;
-  }
   if (startDate && endDate) {
     query.date = {
       $gte: new Date(startDate).setUTCHours(0, 0, 0, 0),
@@ -61,19 +69,28 @@ const getActivityLogs = asyncHandler(async (req, res) => {
     };
   }
 
-  // If supervisor, filter by assigned sites
+  // Apply site filtering based on user role and provided siteId
   if (req.user.role === 'supervisor') {
-    const assignedSites = req.user.assignedSites;
-    if (query.siteId && !assignedSites.includes(query.siteId)) {
-      res.status(403).json({
-        message: 'Not authorized to view activity logs for this site'
-      });
-      return;
+    const assignedSites = req.user.assignedSites.map(id => id.toString()); // Ensure string comparison
+
+    if (siteId) {
+      // If specific siteId is requested, ensure supervisor is authorized for it
+      if (!assignedSites.includes(siteId)) {
+        res.status(403).json({ message: 'Not authorized to view activity logs for this site' });
+        return;
+      }
+      query.siteId = siteId; // Apply the specific siteId filter
+    } else {
+      // If no specific siteId is requested, show all assigned sites for this supervisor
+      query.siteId = { $in: assignedSites };
     }
-    query.siteId = {
-      $in: assignedSites
-    };
+  } else if (siteId) {
+    // If user is ADMIN and a specific siteId is requested, apply that siteId filter
+    // Admins have access to all sites, so no authorization check is needed here, just the filter application.
+    query.siteId = siteId;
   }
+  // If Admin and no siteId is provided, query.siteId remains undefined, meaning fetch all activities (admin's default view)
+
 
   const activityLogs = await ActivityLog.find(query)
     .populate('siteId', 'name')

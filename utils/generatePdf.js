@@ -1,10 +1,11 @@
+// construction/backend/utils/generatePdf.js
 const PDFDocument = require('pdfkit');
 
 const generatePdfReport = async (reportData) => {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({
       size: 'A4',
-      margin: 50
+      margin: 30
     });
     let buffers = [];
 
@@ -15,109 +16,173 @@ const generatePdfReport = async (reportData) => {
     });
     doc.on('error', reject);
 
-    doc.fontSize(24).text('Contractor Management Report', {
+    // Header for the entire report
+    doc.fontSize(20).text('Contractor Management System Report', {
       align: 'center'
     });
-    doc.moveDown();
+    doc.moveDown(0.5);
+    doc.fontSize(10).text(`Report Generated: ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString()}`, { align: 'center' });
+    doc.moveDown(1.5);
 
-    reportData.forEach(siteReport => {
-      doc.fontSize(18).text(`Project: ${siteReport.siteName} (${siteReport.siteLocation})`, {
-        underline: true
-      });
-      doc.fontSize(12).text(`Supervisors: ${siteReport.supervisors.join(', ')}`);
-      doc.fontSize(12).text(`Start Date: ${new Date(siteReport.startDate).toLocaleDateString()}`);
-      doc.moveDown();
-
-      // Summary
-      doc.fontSize(14).text('Summary:', {
-        underline: true
-      });
-      doc.fontSize(12).text(`Total Material Cost: $${siteReport.summary.totalMaterialCost.toFixed(2)}`);
-      doc.fontSize(12).text(`Total Advance Given: $${siteReport.summary.totalAdvanceGiven.toFixed(2)}`);
-      doc.moveDown();
-
-      // Worker Salaries
-      doc.fontSize(14).text('Worker Salaries:', {
-        underline: true
-      });
-      if (siteReport.workers.length > 0) {
-        siteReport.workers.forEach(worker => {
-          doc.fontSize(12).text(`- ${worker.workerName} (${worker.workerRole})`);
-          doc.fontSize(10).text(`  Daily Rate: $${worker.dailyRate.toFixed(2)}`);
-          doc.fontSize(10).text(`  Total Attendance Days: ${worker.totalAttendanceDays}`);
-          doc.fontSize(10).text(`  Gross Salary: $${worker.grossSalary.toFixed(2)}`);
-          doc.fontSize(10).text(`  Advance Deducted: $${worker.totalAdvanceDeducted.toFixed(2)}`);
-          doc.fontSize(10).text(`  Net Salary: $${worker.netSalary.toFixed(2)}`);
-          doc.moveDown(0.5);
-        });
-      } else {
-        doc.fontSize(12).text('No worker salary data for this period.');
-      }
-      doc.moveDown();
-
-      // Material Logs
-      doc.fontSize(14).text('Material Logs:', {
-        underline: true
-      });
-      if (siteReport.materials.length > 0) {
-        siteReport.materials.forEach(material => {
-          doc.fontSize(10).text(`- ${new Date(material.date).toLocaleDateString()}: ${material.material} (${material.brand || 'N/A'}) - ${material.quantity} ${material.unit} @ $${material.pricePerUnit}/unit = $${material.total.toFixed(2)} (Logged by: ${material.recordedBy ? material.recordedBy.name : 'N/A'})`);
-        });
-      } else {
-        doc.fontSize(12).text('No material logs for this period.');
-      }
-      doc.moveDown();
-
-      // Activity Logs
-      doc.fontSize(14).text('Activity Logs:', {
-        underline: true
-      });
-      if (siteReport.activities.length > 0) {
-        siteReport.activities.forEach(activity => {
-          doc.fontSize(10).text(`- ${new Date(activity.date).toLocaleDateString()} (${activity.supervisorId ? activity.supervisorId.name : 'N/A'}): ${activity.message}`);
-        });
-      } else {
-        doc.fontSize(12).text('No activity logs for this period.');
-      }
-      doc.moveDown();
-
-      // Salary Logs (previously calculated weekly salaries)
-      doc.fontSize(14).text('Weekly Salary Payouts:', {
-        underline: true
-      });
-      if (siteReport.salaryLogs.length > 0) {
-        siteReport.salaryLogs.forEach(salaryLog => {
-          doc.fontSize(10).text(`- Worker: ${salaryLog.workerId ? salaryLog.workerId.name : 'N/A'} (${salaryLog.workerId ? salaryLog.workerId.role : 'N/A'})`);
-          doc.fontSize(10).text(`  Week: ${new Date(salaryLog.weekStart).toLocaleDateString()} - ${new Date(salaryLog.weekEnd).toLocaleDateString()}`);
-          doc.fontSize(10).text(`  Total Attendance Days: ${salaryLog.totalAttendanceDays}`);
-          doc.fontSize(10).text(`  Gross: $${salaryLog.grossSalary.toFixed(2)}, Advance Deducted: $${salaryLog.totalAdvanceDeducted.toFixed(2)}, Net: $${salaryLog.netSalary.toFixed(2)}`);
-          doc.fontSize(10).text(`  Paid: ${salaryLog.paid ? 'Yes' : 'No'} ${salaryLog.paymentDate ? `(${new Date(salaryLog.paymentDate).toLocaleDateString()})` : ''}`);
-          doc.moveDown(0.3);
-        });
-      } else {
-        doc.fontSize(12).text('No weekly salary logs for this period.');
-      }
-      doc.moveDown();
-
-
-      // Advance Logs
-      doc.fontSize(14).text('Advance Payment Logs:', {
-        underline: true
-      });
-      if (siteReport.advances.length > 0) {
-        siteReport.advances.forEach(advance => {
-          doc.fontSize(10).text(`- Worker: ${advance.workerId ? advance.workerId.name : 'N/A'}`);
-          doc.fontSize(10).text(`  Date: ${new Date(advance.date).toLocaleDateString()}, Amount: $${advance.amount.toFixed(2)}, Reason: ${advance.reason}, By: ${advance.recordedBy ? advance.recordedBy.name : 'N/A'}`);
-          doc.moveDown(0.3);
-        });
-      } else {
-        doc.fontSize(12).text('No advance logs for this period.');
-      }
-      doc.moveDown();
-
-      if (siteReport !== reportData[reportData.length - 1]) {
+    reportData.forEach((siteReport, index) => {
+      if (index > 0) {
         doc.addPage();
       }
+
+      const siteName = siteReport.siteName || 'N/A Site';
+      const siteLocation = siteReport.siteLocation || 'N/A Location';
+      const siteStartDate = siteReport.startDate ? new Date(siteReport.startDate).toLocaleDateString() : 'N/A Date';
+      const supervisors = (siteReport.supervisors && Array.isArray(siteReport.supervisors)) ? siteReport.supervisors.join(', ') : 'N/A Supervisors';
+
+      doc.fontSize(16).fillColor('#333').text(`Project: ${siteName} (${siteLocation})`, {
+        underline: true
+      });
+      doc.moveDown(0.5);
+      doc.fontSize(10).fillColor('#555').text(`Supervisors: ${supervisors}`);
+      doc.fontSize(10).fillColor('#555').text(`Project Start Date: ${siteStartDate}`);
+      doc.fontSize(10).fillColor('#555').text(`Total Workers Assigned: ${siteReport.totalWorkersAssigned}`);
+      doc.moveDown(1);
+
+      // --- Overall Site Summary ---
+      doc.fontSize(12).fillColor('#333').text('Overall Site Summary:', {
+        underline: true
+      });
+      doc.fontSize(10).text(`Total Material Cost for Period: ₹${(siteReport.summary && typeof siteReport.summary.totalMaterialCost === 'number' ? siteReport.summary.totalMaterialCost : 0).toFixed(2)}`);
+      doc.fontSize(10).text(`Total Advance Given for Period: ₹${(siteReport.summary && typeof siteReport.summary.totalAdvanceGiven === 'number' ? siteReport.summary.totalAdvanceGiven : 0).toFixed(2)}`);
+      doc.moveDown(1);
+
+
+      // Helper function to draw a table
+      const drawTable = (headers, data, rowMapper, columnWidths, title) => {
+        if (title) {
+          doc.fontSize(12).fillColor('#333').text(title, { underline: true });
+          doc.moveDown(0.5);
+        }
+
+        if (!data || data.length === 0) {
+          doc.fontSize(10).fillColor('#777').text('No data available for this section.', doc.x, doc.y + 5);
+          doc.moveDown(1);
+          return;
+        }
+
+        const tableTop = doc.y + 10;
+        const startX = doc.page.margins.left;
+        const endX = doc.page.width - doc.page.margins.right;
+        const rowHeight = 20;
+
+        let currentY = tableTop;
+
+        // Draw Headers
+        doc.font('Helvetica-Bold').fontSize(9);
+        headers.forEach((header, i) => {
+          const xCoordinate = startX + columnWidths.slice(0, i).reduce((a, b) => a + b, 0);
+          const width = columnWidths[i];
+
+          doc.text(header, xCoordinate, currentY, {
+            width: width,
+            align: 'center'
+          });
+        });
+
+        currentY += rowHeight;
+        doc.rect(startX, tableTop, endX - startX, rowHeight).stroke();
+
+
+        doc.font('Helvetica').fontSize(8);
+
+        data.forEach((item, rowIndex) => {
+          let colX = startX;
+          const mappedRow = rowMapper(item);
+
+          mappedRow.forEach((cellText, i) => {
+            const cellWidth = columnWidths[i] - 4;
+
+            doc.text(String(cellText), colX + 2, currentY + 5, {
+              width: cellWidth,
+              align: 'left',
+              height: rowHeight,
+              valign: 'center'
+            });
+            colX += columnWidths[i];
+          });
+          doc.rect(startX, currentY, endX - startX, rowHeight).stroke();
+          currentY += rowHeight;
+
+          if (currentY + rowHeight > doc.page.height - doc.page.margins.bottom) {
+              doc.addPage();
+              currentY = doc.page.margins.top + 30;
+              doc.x = doc.page.margins.left;
+              doc.font('Helvetica-Bold').fontSize(9);
+              headers.forEach((header, i) => {
+                doc.text(header, doc.x + columnWidths.slice(0, i).reduce((a, b) => a + b, 0), currentY, {
+                  width: columnWidths[i],
+                  align: 'center'
+                });
+              });
+              currentY += rowHeight;
+              doc.rect(startX, currentY - rowHeight, endX - startX, rowHeight).stroke();
+              doc.font('Helvetica').fontSize(8);
+          }
+        });
+        doc.moveDown(1);
+        doc.y = currentY + 10;
+        doc.x = doc.page.margins.left;
+      };
+
+
+      // --- Worker Salary Calculations Table ---
+      const salaryHeaders = ['Worker', 'Role', 'RFID', 'Att. Days', 'Daily Rate', 'Gross', 'Advance', 'Net'];
+      const salaryColumnWidths = [80, 50, 60, 50, 50, 50, 50, 50];
+      drawTable(salaryHeaders, siteReport.salaryCalculations, (sal) => [
+        sal.workerName || 'N/A',
+        sal.workerRole || 'N/A',
+        sal.rfidId || 'N/A',
+        (typeof sal.totalAttendanceDays === 'number' ? sal.totalAttendanceDays.toFixed(1) : '0.0'),
+        (typeof sal.dailyRateUsed === 'number' ? `₹${sal.dailyRateUsed.toFixed(2)}` : '₹0.00'),
+        (typeof sal.grossSalary === 'number' ? `₹${sal.grossSalary.toFixed(2)}` : '₹0.00'),
+        (typeof sal.totalAdvance === 'number' ? `₹${sal.totalAdvance.toFixed(2)}` : '₹0.00'),
+        (typeof sal.netSalary === 'number' ? `₹${sal.netSalary.toFixed(2)}` : '₹0.00'),
+      ], salaryColumnWidths, 'Worker Salary Calculations');
+
+
+      // --- Material Logs Table ---
+      const materialHeaders = ['Date', 'Material', 'Brand', 'Qty', 'Unit', 'Price/Unit', 'Total Cost', 'Recorded By'];
+      const materialColumnWidths = [60, 80, 60, 40, 40, 50, 50, 70];
+      drawTable(materialHeaders, siteReport.materialSummary, (m) => [
+        m.date ? new Date(m.date).toLocaleDateString() : 'N/A Date',
+        m.material || 'N/A',
+        m.brand || 'N/A',
+        m.quantity || 'N/A',
+        m.unit || 'N/A',
+        (typeof m.pricePerUnit === 'number' ? `₹${m.pricePerUnit.toFixed(2)}` : '₹0.00'),
+        (typeof m.totalCost === 'number' ? `₹${m.totalCost.toFixed(2)}` : '₹0.00'),
+        m.recordedBy?.name || 'N/A',
+      ], materialColumnWidths, 'Material Logs');
+
+
+      // --- Activity Logs Table ---
+      const activityHeaders = ['Date', 'Message', 'Supervisor'];
+      const activityColumnWidths = [60, 280, 80];
+      drawTable(activityHeaders, siteReport.activityLogs, (a) => [
+        a.date ? new Date(a.date).toLocaleDateString() : 'N/A Date',
+        a.message || 'N/A',
+        a.supervisorId?.name || 'N/A',
+      ], activityColumnWidths, 'Daily Activity Logs');
+
+
+      // --- Advance Payment Logs Table ---
+      const advanceHeaders = ['Date', 'Worker Name', 'Amount', 'Reason', 'Recorded By'];
+      const advanceColumnWidths = [60, 100, 50, 120, 80];
+      drawTable(advanceHeaders, siteReport.advanceLogs, (adv) => [
+        adv.date ? new Date(adv.date).toLocaleDateString() : 'N/A Date',
+        adv.workerId?.name || 'N/A Worker',
+        (typeof adv.amount === 'number' ? `₹${adv.amount.toFixed(2)}` : '₹0.00'),
+        adv.reason || 'No reason provided',
+        adv.recordedBy?.name || 'N/A',
+      ], advanceColumnWidths, 'Advance Payment Logs');
+
+
+      doc.moveDown(2);
     });
 
     doc.end();

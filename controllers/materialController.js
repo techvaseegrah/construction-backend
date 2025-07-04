@@ -2,7 +2,8 @@
 const asyncHandler = require('express-async-handler');
 const MaterialEntry = require('../models/MaterialEntry');
 const Site = require('../models/Site');
-const mongoose = require('mongoose'); // Import mongoose to use mongoose.Types.ObjectId
+const User = require('../models/User');
+const mongoose = require('mongoose'); // Ensure mongoose is imported
 
 // @desc    Log a new material entry
 // @route   POST /api/materials
@@ -16,25 +17,22 @@ const createMaterialLog = asyncHandler(async (req, res) => {
     return;
   }
 
-  // Ensure supervisor is assigned to this site
   if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(siteId)) {
     res.status(403).json({ message: 'Not authorized to log materials for this site' });
     return;
   }
 
-  const total = quantity * pricePerUnit;
-
   // Determine recordedBy ID: Use actual user ID if it's a valid ObjectId,
   // otherwise, use a placeholder ObjectId for dev users to pass validation.
-  let recordedById;
+  let actualRecordedBy;
   if (req.user._id === 'dev_admin_id' || req.user._id === 'dev_supervisor_id') {
-      // For development users, create a dummy but valid ObjectId.
-      // NOTE: This ObjectId won't correspond to a real user in DB unless you manually create one.
-      recordedById = new mongoose.Types.ObjectId('60a7b1b3c9f2b1001a4e2d3f'); // A static dummy ObjectId
+      // Use a static dummy ObjectId for dev users
+      actualRecordedBy = new mongoose.Types.ObjectId('60a7b1b3c9f2b1001a4e2d3f');
   } else {
-      recordedById = req.user._id; // Use the actual user's ObjectId
+      actualRecordedBy = req.user._id; // Use the actual user's ObjectId
   }
 
+  const total = quantity * pricePerUnit;
 
   const materialEntry = await MaterialEntry.create({
     siteId,
@@ -45,7 +43,7 @@ const createMaterialLog = asyncHandler(async (req, res) => {
     pricePerUnit,
     total,
     date: new Date(date).setUTCHours(0, 0, 0, 0),
-    recordedBy: recordedById, // Use the determined ID
+    recordedBy: actualRecordedBy, // Use the determined ID
   });
 
   res.status(201).json(materialEntry);
@@ -60,7 +58,7 @@ const getMaterialLogs = asyncHandler(async (req, res) => {
   let query = {};
 
   if (material) {
-    query.material = { $regex: material, $options: 'i' }; // Case-insensitive search
+    query.material = { $regex: material, $options: 'i' };
   }
   if (startDate && endDate) {
     query.date = {
@@ -69,7 +67,6 @@ const getMaterialLogs = asyncHandler(async (req, res) => {
     };
   }
 
-  // Apply site filtering based on user role and provided siteId
   if (req.user.role === 'supervisor') {
     const assignedSites = req.user.assignedSites.map(id => id.toString());
 
@@ -88,9 +85,23 @@ const getMaterialLogs = asyncHandler(async (req, res) => {
 
   const materialLogs = await MaterialEntry.find(query)
     .populate('siteId', 'name')
-    .populate('recordedBy', 'name');
+    .populate('recordedBy', 'name role');
 
-  res.json(materialLogs);
+  const formattedMaterialLogs = materialLogs.map(log => {
+    const recordedByName = log.recordedBy ?
+      (log.recordedBy.role === 'admin' ? 'Admin' : log.recordedBy.name || 'N/A') :
+      'N/A';
+
+    return {
+      ...log.toObject(),
+      recordedBy: {
+        name: recordedByName,
+        role: log.recordedBy?.role || 'N/A'
+      }
+    };
+  });
+
+  res.json(formattedMaterialLogs);
 });
 
 // @desc    Update a material entry
@@ -102,7 +113,6 @@ const updateMaterialLog = asyncHandler(async (req, res) => {
   const materialEntry = await MaterialEntry.findById(req.params.id);
 
   if (materialEntry) {
-    // Ensure supervisor is authorized for this site
     if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(materialEntry.siteId.toString())) {
       res.status(403).json({ message: 'Not authorized to update material log for this site' });
       return;
@@ -113,7 +123,7 @@ const updateMaterialLog = asyncHandler(async (req, res) => {
     materialEntry.quantity = quantity || materialEntry.quantity;
     materialEntry.unit = unit || materialEntry.unit;
     materialEntry.pricePerUnit = pricePerUnit || materialEntry.pricePerUnit;
-    materialEntry.total = materialEntry.quantity * materialEntry.pricePerUnit; // Recalculate total
+    materialEntry.total = materialEntry.quantity * materialEntry.pricePerUnit;
     materialEntry.date = date ? new Date(date).setUTCHours(0, 0, 0, 0) : materialEntry.date;
 
     const updatedMaterialEntry = await materialEntry.save();
@@ -130,7 +140,6 @@ const deleteMaterialLog = asyncHandler(async (req, res) => {
   const materialEntry = await MaterialEntry.findById(req.params.id);
 
   if (materialEntry) {
-    // Ensure supervisor is authorized for this site
     if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(materialEntry.siteId.toString())) {
       res.status(403).json({ message: 'Not authorized to delete material log for this site' });
       return;

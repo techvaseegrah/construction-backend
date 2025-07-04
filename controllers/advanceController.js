@@ -3,10 +3,11 @@ const asyncHandler = require('express-async-handler');
 const AdvanceEntry = require('../models/AdvanceEntry');
 const Worker = require('../models/Worker');
 const Site = require('../models/Site');
-const mongoose = require('mongoose'); // Import mongoose to use mongoose.Types.ObjectId
+const User = require('../models/User'); // Ensure User model is imported
+const mongoose = require('mongoose');
 
 // @desc    Log an advance payment
-// @route   POST /api/advances/log
+// @route   POST /api/advances
 // @access  Private (Supervisor/Admin)
 const createAdvanceLog = asyncHandler(async (req, res) => {
   const {
@@ -17,7 +18,6 @@ const createAdvanceLog = asyncHandler(async (req, res) => {
     reason
   } = req.body;
 
-  // Check if worker and site exist
   const worker = await Worker.findById(workerId);
   const site = await Site.findById(siteId);
 
@@ -28,7 +28,6 @@ const createAdvanceLog = asyncHandler(async (req, res) => {
     return;
   }
 
-  // Ensure supervisor is assigned to this site
   if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(siteId)) {
     res.status(403).json({
       message: 'Not authorized to log advance for this site'
@@ -36,7 +35,6 @@ const createAdvanceLog = asyncHandler(async (req, res) => {
     return;
   }
 
-  // Ensure worker is assigned to this site
   const isWorkerAssignedToSite = site.assignedWorkers.some(aw => aw.workerId.toString() === workerId);
   if (!isWorkerAssignedToSite) {
     res.status(400).json({
@@ -45,16 +43,9 @@ const createAdvanceLog = asyncHandler(async (req, res) => {
     return;
   }
 
-  // Determine recordedBy ID: Use actual user ID if it's a valid ObjectId,
-  // otherwise, use a placeholder ObjectId for dev users to pass validation.
-  let recordedById;
-  if (req.user._id === 'dev_admin_id' || req.user._id === 'dev_supervisor_id') {
-      // For development users, create a dummy but valid ObjectId.
-      // NOTE: This ObjectId won't correspond to a real user in DB unless you manually create one.
-      recordedById = new mongoose.Types.ObjectId('60a7b1b3c9f2b1001a4e2d3d'); // A static dummy ObjectId, changed last digit for uniqueness
-  } else {
-      recordedById = req.user._id; // Use the actual user's ObjectId
-  }
+  // Always use req.user._id directly for recordedBy.
+  // The schema validation will ensure it's an ObjectId.
+  const recordedBy = req.user._id;
 
   const advance = await AdvanceEntry.create({
     workerId,
@@ -62,7 +53,7 @@ const createAdvanceLog = asyncHandler(async (req, res) => {
     amount,
     date: date || Date.now(),
     reason,
-    recordedBy: recordedById, // Use the determined ID
+    recordedBy: recordedBy, // Use the actual user's ID
   });
 
   res.status(201).json(advance);
@@ -90,7 +81,6 @@ const getAdvanceLogs = asyncHandler(async (req, res) => {
     };
   }
 
-  // Apply site filtering based on user role and provided siteId
   if (req.user.role === 'supervisor') {
     const assignedSites = req.user.assignedSites.map(id => id.toString());
 
@@ -108,7 +98,6 @@ const getAdvanceLogs = asyncHandler(async (req, res) => {
       };
     }
   } else if (siteId) {
-    // If user is ADMIN and a specific siteId is requested, apply that siteId filter
     query.siteId = siteId;
   }
 
@@ -116,9 +105,18 @@ const getAdvanceLogs = asyncHandler(async (req, res) => {
   const advanceLogs = await AdvanceEntry.find(query)
     .populate('workerId', 'name role')
     .populate('siteId', 'name')
-    .populate('recordedBy', 'name role');
+    .populate('recordedBy', 'name role'); // MODIFIED: Populate role of recordedBy
 
-  res.json(advanceLogs);
+  // MODIFIED: Map results to display 'Admin' if role is admin
+  const formattedAdvanceLogs = advanceLogs.map(log => ({
+    ...log.toObject(),
+    recordedBy: {
+      name: log.recordedBy?.role === 'admin' ? 'Admin' : log.recordedBy?.name || 'N/A',
+      role: log.recordedBy?.role || 'N/A'
+    }
+  }));
+
+  res.json(formattedAdvanceLogs);
 });
 
 // @desc    Update an advance entry
@@ -134,7 +132,6 @@ const updateAdvanceLog = asyncHandler(async (req, res) => {
   const advance = await AdvanceEntry.findById(req.params.id);
 
   if (advance) {
-    // Ensure supervisor is authorized for this site
     if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(advance.siteId.toString())) {
       res.status(403).json({
         message: 'Not authorized to update advance for this site'
@@ -162,7 +159,6 @@ const deleteAdvanceLog = asyncHandler(async (req, res) => {
   const advance = await AdvanceEntry.findById(req.params.id);
 
   if (advance) {
-    // Ensure supervisor is authorized for this site
     if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(advance.siteId.toString())) {
       res.status(403).json({
         message: 'Not authorized to delete advance for this site'

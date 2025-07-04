@@ -111,7 +111,7 @@ const generateReport = asyncHandler(async (req, res) => {
     const materials = await MaterialEntry.find({
       siteId: site._id,
       date: { $gte: reportStartDate, $lte: reportEndDate }
-    }).populate('recordedBy', 'name');
+    }).populate('recordedBy', 'name role'); // MODIFIED: Populate role
     siteReport.materialSummary = materials.map(m => ({
       material: m.material,
       brand: m.brand,
@@ -120,7 +120,10 @@ const generateReport = asyncHandler(async (req, res) => {
       pricePerUnit: m.pricePerUnit,
       totalCost: m.total,
       date: m.date,
-      recordedBy: m.recordedBy
+      recordedBy: {
+        name: m.recordedBy?.role === 'admin' ? 'Admin' : m.recordedBy?.name || 'N/A',
+        role: m.recordedBy?.role || 'N/A'
+      }
     }));
     const totalMaterialCost = materials.reduce((sum, m) => sum + m.total, 0);
     console.log('Material Summary collected.');
@@ -130,13 +133,16 @@ const generateReport = asyncHandler(async (req, res) => {
     const advances = await AdvanceEntry.find({
       siteId: site._id,
       date: { $gte: reportStartDate, $lte: reportEndDate }
-    }).populate('workerId', 'name role').populate('recordedBy', 'name');
+    }).populate('workerId', 'name role').populate('recordedBy', 'name role'); // MODIFIED: Populate role
     siteReport.advanceLogs = advances.map(a => ({
       workerId: a.workerId,
       amount: a.amount,
       date: a.date,
       reason: a.reason,
-      recordedBy: a.recordedBy
+      recordedBy: {
+        name: a.recordedBy?.role === 'admin' ? 'Admin' : a.recordedBy?.name || 'N/A',
+        role: a.recordedBy?.role || 'N/A'
+      }
     }));
     const totalAdvanceGiven = advances.reduce((sum, a) => sum + a.amount, 0);
     console.log('Advance Logs collected.');
@@ -187,11 +193,14 @@ const generateReport = asyncHandler(async (req, res) => {
     const activities = await ActivityLog.find({
       siteId: site._id,
       date: { $gte: reportStartDate, $lte: reportEndDate }
-    }).populate('supervisorId', 'name');
+    }).populate('supervisorId', 'name role'); // MODIFIED: Populate role
     siteReport.activityLogs = activities.map(a => ({
       date: a.date,
       message: a.message,
-      supervisorId: a.supervisorId
+      supervisorId: {
+        name: a.supervisorId?.role === 'admin' ? 'Admin' : a.supervisorId?.name || 'N/A',
+        role: a.supervisorId?.role || 'N/A'
+      }
     }));
     console.log('Activity Logs collected.');
 
@@ -348,7 +357,6 @@ const calculateAndLogWeeklySalaries = asyncHandler(async (req, res) => {
       const grossSalary = totalAttendanceDays * dailyRate;
       const netSalary = grossSalary - totalAdvanceDeducted;
 
-      // Check if a salary log already exists for this worker, site, and week
       const existingLog = await SalaryLog.findOne({
           workerId: worker._id,
           siteId: site._id,
@@ -357,20 +365,17 @@ const calculateAndLogWeeklySalaries = asyncHandler(async (req, res) => {
       });
 
       if (existingLog) {
-          // If it exists, update it instead of creating a duplicate
           existingLog.totalAttendanceDays = totalAttendanceDays;
           existingLog.dailyRateUsed = dailyRate;
           existingLog.grossSalary = grossSalary;
           existingLog.totalAdvanceDeducted = totalAdvanceDeducted;
           existingLog.netSalary = netSalary;
-          // Only update recordedBy if it's currently null or if it's a dev user
           if (!existingLog.recordedBy || existingLog.recordedBy.toString() === '60a7b1b3c9f2b1001a4e2d3c') {
               existingLog.recordedBy = recordedById;
           }
           await existingLog.save();
           console.log(`Updated existing salary log for worker ${worker.name} at site ${site.name} for week ${startOfWeek.toLocaleDateString()}`);
       } else {
-          // Create new log if it doesn't exist
           salaryLogsToSave.push({
             workerId: worker._id,
             siteId: site._id,
@@ -396,14 +401,13 @@ const calculateAndLogWeeklySalaries = asyncHandler(async (req, res) => {
         grossSalary: grossSalary,
         advanceDeducted: totalAdvanceDeducted,
         netSalary: netSalary,
-        paid: existingLog ? existingLog.paid : false // Retain paid status if updating existing
+        paid: existingLog ? existingLog.paid : false
       });
     }
   }
 
-  // Only create new logs that were pushed to salaryLogsToSave
   if (salaryLogsToSave.length > 0) {
-    await SalaryLog.insertMany(salaryLogsToSave); // Use insertMany for efficiency
+    await SalaryLog.insertMany(salaryLogsToSave);
   }
 
   res.status(200).json({
@@ -448,9 +452,18 @@ const getSalaryLogs = asyncHandler(async (req, res) => {
   const salaryLogs = await SalaryLog.find(query)
     .populate('workerId', 'name role')
     .populate('siteId', 'name')
-    .populate('recordedBy', 'name');
+    .populate('recordedBy', 'name role'); // MODIFIED: Populate role for recordedBy
 
-  res.json(salaryLogs);
+  // MODIFIED: Map results to display 'Admin' if role is admin
+  const formattedSalaryLogs = salaryLogs.map(log => ({
+    ...log.toObject(),
+    recordedBy: {
+      name: log.recordedBy?.role === 'admin' ? 'Admin' : log.recordedBy?.name || 'N/A',
+      role: log.recordedBy?.role || 'N/A'
+    }
+  }));
+
+  res.json(formattedSalaryLogs);
 });
 
 // @desc    Update Salary Log Paid Status
@@ -471,11 +484,9 @@ const updateSalaryLogPaidStatus = asyncHandler(async (req, res) => {
     salaryLog.paid = paid;
     salaryLog.paymentDate = paid ? (paymentDate || new Date()) : null;
 
-    // Determine recordedBy ID for the update: Use actual user ID if it's a valid ObjectId,
-    // otherwise, use a placeholder ObjectId for dev users to pass validation.
     let recordedById;
     if (req.user._id === 'dev_admin_id' || req.user._id === 'dev_supervisor_id') {
-        recordedById = new mongoose.Types.ObjectId('60a7b1b3c9f2b1001a4e2d3c'); // Use the same static dummy ObjectId
+        recordedById = new mongoose.Types.ObjectId('60a7b1b3c9f2b1001a4e2d3c');
     } else {
         recordedById = req.user._id;
     }
@@ -485,7 +496,6 @@ const updateSalaryLogPaidStatus = asyncHandler(async (req, res) => {
     if (!salaryLog.recordedBy || salaryLog.recordedBy.toString() === '60a7b1b3c9f2b1001a4e2d3c') {
         salaryLog.recordedBy = recordedById;
     }
-
 
     const updatedSalaryLog = await salaryLog.save();
     res.json({ message: 'Salary log updated successfully', updatedSalaryLog });

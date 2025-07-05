@@ -2,8 +2,10 @@
 const asyncHandler = require('express-async-handler');
 const ActivityLog = require('../models/ActivityLog');
 const Site = require('../models/Site');
-const User = require('../models/User'); // Ensure User model is imported
-const mongoose = require('mongoose');
+
+const User = require('../models/User');
+const mongoose = require('mongoose'); // Import mongoose to use mongoose.Types.ObjectId
+
 
 // @desc    Log daily activity
 // @route   POST /api/activities/log
@@ -15,6 +17,9 @@ const logActivity = asyncHandler(async (req, res) => {
     date
   } = req.body;
 
+
+  // Check if site exists
+
   const site = await Site.findById(siteId);
   if (!site) {
     res.status(404).json({
@@ -23,6 +28,9 @@ const logActivity = asyncHandler(async (req, res) => {
     return;
   }
 
+
+  // Ensure supervisor is assigned to this site
+
   if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(siteId)) {
     res.status(403).json({
       message: 'Not authorized to log activity for this site'
@@ -30,15 +38,20 @@ const logActivity = asyncHandler(async (req, res) => {
     return;
   }
 
-  // Always use req.user._id directly for supervisorId.
-  // The schema validation will ensure it's an ObjectId.
-  // The issue with 'dev_admin_id' was fixed by ensuring it's converted to ObjectId
-  // or by using actual users. For new logs, req.user._id should be fine.
-  const supervisorId = req.user._id;
+
+  // Determine supervisorId: Use actual user ID if it's a valid ObjectId,
+  // otherwise, use a placeholder ObjectId for dev users to pass validation.
+  let actualSupervisorId;
+  if (req.user._id === 'dev_admin_id' || req.user._id === 'dev_supervisor_id') {
+      actualSupervisorId = new mongoose.Types.ObjectId('60a7b1b3c9f2b1001a4e2d3e'); // A static dummy ObjectId
+  } else {
+      actualSupervisorId = req.user._id; // Use the actual user's ObjectId
+  }
 
   const activityLog = await ActivityLog.create({
     siteId,
-    supervisorId: supervisorId, // Use the actual user's ID
+    supervisorId: actualSupervisorId, // Use the determined ID
+
     date: date || Date.now(),
     message,
   });
@@ -51,15 +64,15 @@ const logActivity = asyncHandler(async (req, res) => {
 // @access  Private (Admin/Supervisor)
 const getActivityLogs = asyncHandler(async (req, res) => {
   const {
-    siteId,
+
+    siteId, // This comes from the frontend, for the currently selected project
+
     startDate,
     endDate
   } = req.query;
   let query = {};
 
-  console.log('--- getActivityLogs started ---');
-  console.log('Received query params:', req.query);
-  console.log('User Role:', req.user.role);
+
 
   if (startDate && endDate) {
     query.date = {
@@ -68,38 +81,37 @@ const getActivityLogs = asyncHandler(async (req, res) => {
     };
   }
 
+
+  // Apply site filtering based on user role and provided siteId
   if (req.user.role === 'supervisor') {
-    const assignedSites = req.user.assignedSites.map(id => id.toString());
+    const assignedSites = req.user.assignedSites.map(id => id.toString()); // Ensure string comparison
 
     if (siteId) {
+      // If specific siteId is requested, ensure supervisor is authorized for it
+
       if (!assignedSites.includes(siteId)) {
         res.status(403).json({ message: 'Not authorized to view activity logs for this site' });
         return;
       }
-      query.siteId = siteId;
+
+      query.siteId = siteId; // Apply the specific siteId filter
     } else {
+      // If no specific siteId is requested, show all assigned sites for this supervisor
       query.siteId = { $in: assignedSites };
     }
   } else if (siteId) {
+    // If user is ADMIN and a specific siteId is requested, apply that siteId filter
+    // Admins have access to all sites, so no authorization check is needed here, just the filter application.
     query.siteId = siteId;
   }
+  // If Admin and no siteId is provided, query.siteId remains undefined, meaning fetch all activities (admin's default view)
 
-  console.log('Final Mongoose Query for Activity Logs:', JSON.stringify(query));
 
   const activityLogs = await ActivityLog.find(query)
     .populate('siteId', 'name')
-    .populate('supervisorId', 'name role'); // MODIFIED: Populate role of supervisorId
+    .populate('supervisorId', 'name');
 
-  // MODIFIED: Map results to display 'Admin' if role is admin
-  const formattedActivityLogs = activityLogs.map(log => ({
-    ...log.toObject(), // Convert Mongoose document to plain object
-    supervisorId: {
-      name: log.supervisorId?.role === 'admin' ? 'Admin' : log.supervisorId?.name || 'N/A',
-      role: log.supervisorId?.role || 'N/A'
-    }
-  }));
-
-  res.json(formattedActivityLogs);
+  res.json(activityLogs);
 });
 
 // @desc    Update an activity log
@@ -114,12 +126,20 @@ const updateActivity = asyncHandler(async (req, res) => {
   const activityLog = await ActivityLog.findById(req.params.id);
 
   if (activityLog) {
+
+    // Ensure supervisor is authorized for this site
     if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(activityLog.siteId.toString())) {
-      res.status(403).json({ message: 'Not authorized to update activity log for this site' });
+      res.status(403).json({
+        message: 'Not authorized to update activity log for this site'
+      });
       return;
     }
+    // Only the supervisor who logged it or an admin can update it
     if (req.user.role !== 'admin' && activityLog.supervisorId.toString() !== req.user._id.toString()) {
-      res.status(403).json({ message: 'Not authorized to update this activity log' });
+      res.status(403).json({
+        message: 'Not authorized to update this activity log'
+      });
+
       return;
     }
 
@@ -129,7 +149,11 @@ const updateActivity = asyncHandler(async (req, res) => {
     const updatedActivity = await activityLog.save();
     res.json(updatedActivity);
   } else {
-    res.status(404).json({ message: 'Activity log not found' });
+
+    res.status(404).json({
+      message: 'Activity log not found'
+    });
+
   }
 });
 
@@ -140,18 +164,30 @@ const deleteActivity = asyncHandler(async (req, res) => {
   const activityLog = await ActivityLog.findById(req.params.id);
 
   if (activityLog) {
+
+    // Ensure supervisor is authorized for this site
     if (req.user.role === 'supervisor' && !req.user.assignedSites.includes(activityLog.siteId.toString())) {
-      res.status(403).json({ message: 'Not authorized to delete activity log for this site' });
+      res.status(403).json({
+        message: 'Not authorized to delete activity log for this site'
+      });
       return;
     }
+    // Only the supervisor who logged it or an admin can delete it
     if (req.user.role !== 'admin' && activityLog.supervisorId.toString() !== req.user._id.toString()) {
-      res.status(403).json({ message: 'Not authorized to delete this activity log' });
+      res.status(403).json({
+        message: 'Not authorized to delete this activity log'
+      });
       return;
     }
     await activityLog.deleteOne();
-    res.json({ message: 'Activity log removed' });
+    res.json({
+      message: 'Activity log removed'
+    });
   } else {
-    res.status(404).json({ message: 'Activity log not found' });
+    res.status(404).json({
+      message: 'Activity log not found'
+    });
+
   }
 });
 

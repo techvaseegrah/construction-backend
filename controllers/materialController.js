@@ -87,19 +87,18 @@ const getMaterialLogs = asyncHandler(async (req, res) => {
     .populate('siteId', 'name')
     .populate('recordedBy', 'name role');
 
-  const formattedMaterialLogs = materialLogs.map(log => {
-    const recordedByName = log.recordedBy ?
-      (log.recordedBy.role === 'admin' ? 'Admin' : log.recordedBy.name || 'N/A') :
-      'N/A';
-
-    return {
-      ...log.toObject(),
-      recordedBy: {
-        name: recordedByName,
-        role: log.recordedBy?.role || 'N/A'
-      }
-    };
-  });
+const formattedMaterialLogs = materialLogs.map(log => {
+  const recordedByName = log.recordedBy ?
+    (log.recordedBy.role === 'admin' ? 'Admin' : log.recordedBy.name || 'N/A') :
+    'N/A'; // This line determines what's displayed
+  return {
+    ...log.toObject(),
+    recordedBy: {
+      name: recordedByName,
+      role: log.recordedBy?.role || 'N/A'
+    }
+  };
+});
 
   res.json(formattedMaterialLogs);
 });
